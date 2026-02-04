@@ -9,7 +9,7 @@ from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload
 import io
 import functions_framework
-import google.auth.default
+import google.auth
 
 # Configurações
 SLACK_BOT_TOKEN = os.environ.get('SLACK_BOT_TOKEN')
