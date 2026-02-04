@@ -1,12 +1,15 @@
 import os
 import re
 import requests
+import json
+import traceback
 from datetime import datetime
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload
 import io
 import functions_framework
+import google.auth.default
 
 # Configurações
 SLACK_BOT_TOKEN = os.environ.get('SLACK_BOT_TOKEN')
@@ -27,20 +30,31 @@ FIELD_PATTERNS = {
 
 def get_google_services():
     """Inicializa serviços do Google (Drive e Sheets)"""
-    creds = None
-    if os.path.exists('service_account.json'):
-        creds = service_account.Credentials.from_service_account_file(
-            'service_account.json',
-            scopes=[
+    try:
+        if os.path.exists('service_account.json'):
+            creds = service_account.Credentials.from_service_account_file(
+                'service_account.json',
+                scopes=[
+                    'https://www.googleapis.com/auth/drive',
+                    'https://www.googleapis.com/auth/spreadsheets'
+                ]
+            )
+        else:
+            # No GCP, usa credenciais padrão do ambiente
+            creds, project = google.auth.default(scopes=[
                 'https://www.googleapis.com/auth/drive',
                 'https://www.googleapis.com/auth/spreadsheets'
-            ]
-        )
+            ])
+            print(f"[INFO] Usando credenciais padrão do projeto: {project}")
 
-    drive_service = build('drive', 'v3', credentials=creds)
-    sheets_service = build('sheets', 'v4', credentials=creds)
+        drive_service = build('drive', 'v3', credentials=creds)
+        sheets_service = build('sheets', 'v4', credentials=creds)
 
-    return drive_service, sheets_service
+        return drive_service, sheets_service
+    except Exception as e:
+        print(f"[ERROR] Falha ao inicializar serviços Google: {e}")
+        traceback.print_exc()
+        raise
 
 
 def extract_fields(text):
@@ -193,46 +207,76 @@ def append_to_sheets(sheets_service, data):
 @functions_framework.http
 def slack_webhook(request):
     """Endpoint principal que recebe eventos do Slack"""
+    try:
+        # Verificação de URL (Slack envia isso na configuração inicial)
+        data = request.get_json()
+        print(f"[DEBUG] Payload recebido: {json.dumps(data, indent=2, default=str)}")
 
-    # Verificação de URL (Slack envia isso na configuração inicial)
-    data = request.get_json()
+        if data.get('type') == 'url_verification':
+            print("[INFO] Verificação de URL do Slack")
+            return {'challenge': data['challenge']}
 
-    if data.get('type') == 'url_verification':
-        return {'challenge': data['challenge']}
+        # Ignorar eventos de retry ou do próprio bot
+        if request.headers.get('X-Slack-Retry-Num'):
+            print("[INFO] Ignorando retry do Slack")
+            return {'ok': True}
 
-    # Ignorar eventos de retry ou do próprio bot
-    if request.headers.get('X-Slack-Retry-Num'):
+        event = data.get('event', {})
+        print(f"[DEBUG] Tipo de evento: {event.get('type')}")
+        print(f"[DEBUG] Bot ID: {event.get('bot_id')}")
+        print(f"[DEBUG] Subtype: {event.get('subtype')}")
+
+        # Processar apenas mensagens de usuários (não bots)
+        if event.get('type') != 'message' or event.get('bot_id'):
+            print(f"[INFO] Ignorando: tipo={event.get('type')}, bot_id={event.get('bot_id')}")
+            return {'ok': True}
+
+        # Ignorar subtipos de mensagem (edições, etc)
+        if event.get('subtype'):
+            print(f"[INFO] Ignorando subtype: {event.get('subtype')}")
+            return {'ok': True}
+
+        text = event.get('text', '')
+        files = event.get('files', [])
+        print(f"[DEBUG] Texto da mensagem: {text}")
+        print(f"[DEBUG] Arquivos anexados: {len(files)}")
+
+        # Verificar se a mensagem tem os campos esperados
+        fields = extract_fields(text)
+        print(f"[DEBUG] Campos extraídos: {fields}")
+
+        # Se não encontrou pelo menos DATA e VALOR, ignora
+        if not fields.get('DATA') or not fields.get('VALOR'):
+            print(f"[INFO] Campos obrigatórios não encontrados. DATA={fields.get('DATA')}, VALOR={fields.get('VALOR')}")
+            return {'ok': True}
+
+        print("[INFO] Processando mensagem válida...")
+        print(f"[DEBUG] DRIVE_FOLDER_ID: {GOOGLE_DRIVE_FOLDER_ID}")
+        print(f"[DEBUG] SHEETS_ID: {GOOGLE_SHEETS_ID}")
+
+        # Inicializar serviços Google
+        drive_service, sheets_service = get_google_services()
+
+        # Se tiver arquivo, faz upload para o Drive
+        link_comprovante = ''
+        if files:
+            file_info = files[0]  # Pega o primeiro arquivo
+            print(f"[INFO] Baixando arquivo: {file_info.get('name')}")
+            content, original_filename, mimetype = download_slack_file(file_info)
+            print(f"[INFO] Fazendo upload para o Drive...")
+            link_comprovante = upload_to_drive(drive_service, content, original_filename, mimetype, fields)
+            print(f"[INFO] Arquivo salvo: {link_comprovante}")
+
+        fields['LINK_COMPROVANTE'] = link_comprovante
+
+        # Registrar no Sheets
+        print("[INFO] Salvando no Google Sheets...")
+        append_to_sheets(sheets_service, fields)
+        print("[INFO] Registro salvo com sucesso!")
+
         return {'ok': True}
 
-    event = data.get('event', {})
-
-    # Processar apenas mensagens de usuários (não bots)
-    if event.get('type') != 'message' or event.get('bot_id'):
-        return {'ok': True}
-
-    text = event.get('text', '')
-    files = event.get('files', [])
-
-    # Verificar se a mensagem tem os campos esperados
-    fields = extract_fields(text)
-
-    # Se não encontrou pelo menos DATA e VALOR, ignora
-    if not fields.get('DATA') or not fields.get('VALOR'):
-        return {'ok': True}
-
-    # Inicializar serviços Google
-    drive_service, sheets_service = get_google_services()
-
-    # Se tiver arquivo, faz upload para o Drive
-    link_comprovante = ''
-    if files:
-        file_info = files[0]  # Pega o primeiro arquivo
-        content, original_filename, mimetype = download_slack_file(file_info)
-        link_comprovante = upload_to_drive(drive_service, content, original_filename, mimetype, fields)
-
-    fields['LINK_COMPROVANTE'] = link_comprovante
-
-    # Registrar no Sheets
-    append_to_sheets(sheets_service, fields)
-
-    return {'ok': True}
+    except Exception as e:
+        print(f"[ERROR] Erro ao processar webhook: {e}")
+        traceback.print_exc()
+        return {'ok': False, 'error': str(e)}, 500
