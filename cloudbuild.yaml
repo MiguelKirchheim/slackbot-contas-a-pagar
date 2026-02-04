@@ -1,0 +1,54 @@
+steps:
+  # Build da imagem
+  - name: 'gcr.io/cloud-builders/docker'
+    id: 'build'
+    args:
+      - 'build'
+      - '-t'
+      - 'us-central1-docker.pkg.dev/$PROJECT_ID/etl-jobs/slackbot-contas-a-pagar:${SHORT_SHA}'
+      - '-t'
+      - 'us-central1-docker.pkg.dev/$PROJECT_ID/etl-jobs/slackbot-contas-a-pagar:latest'
+      - '.'
+
+  # Push tag SHA
+  - name: 'gcr.io/cloud-builders/docker'
+    id: 'push-sha'
+    args:
+      - 'push'
+      - 'us-central1-docker.pkg.dev/$PROJECT_ID/etl-jobs/slackbot-contas-a-pagar:${SHORT_SHA}'
+
+  # Push tag latest
+  - name: 'gcr.io/cloud-builders/docker'
+    id: 'push-latest'
+    args:
+      - 'push'
+      - 'us-central1-docker.pkg.dev/$PROJECT_ID/etl-jobs/slackbot-contas-a-pagar:latest'
+
+  # Deploy no Cloud Run
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    id: 'deploy'
+    entrypoint: 'gcloud'
+    args:
+      - 'run'
+      - 'deploy'
+      - 'slackbot-contas-a-pagar'
+      - '--image=us-central1-docker.pkg.dev/$PROJECT_ID/etl-jobs/slackbot-contas-a-pagar:${SHORT_SHA}'
+      - '--region=us-central1'
+      - '--platform=managed'
+      - '--memory=512Mi'
+      - '--timeout=60s'
+      - '--max-instances=3'
+      - '--allow-unauthenticated'
+      - '--set-env-vars=GOOGLE_DRIVE_FOLDER_ID=${_DRIVE_FOLDER_ID},GOOGLE_SHEETS_ID=${_SHEETS_ID}'
+      - '--set-secrets=SLACK_BOT_TOKEN=SLACK_BOT_TOKEN:latest,SLACK_SIGNING_SECRET=SLACK_SIGNING_SECRET:latest'
+
+substitutions:
+  _DRIVE_FOLDER_ID: 'SEU_FOLDER_ID'
+  _SHEETS_ID: 'SEU_SHEETS_ID'
+
+options:
+  logging: CLOUD_LOGGING_ONLY
+
+images:
+  - 'us-central1-docker.pkg.dev/$PROJECT_ID/etl-jobs/slackbot-contas-a-pagar:${SHORT_SHA}'
+  - 'us-central1-docker.pkg.dev/$PROJECT_ID/etl-jobs/slackbot-contas-a-pagar:latest'
