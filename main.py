@@ -1,6 +1,5 @@
 import os
 import re
-import json
 import requests
 from datetime import datetime
 from google.oauth2 import service_account
@@ -14,7 +13,7 @@ SLACK_BOT_TOKEN = os.environ.get('SLACK_BOT_TOKEN')
 SLACK_SIGNING_SECRET = os.environ.get('SLACK_SIGNING_SECRET')
 GOOGLE_DRIVE_FOLDER_ID = os.environ.get('GOOGLE_DRIVE_FOLDER_ID')
 GOOGLE_SHEETS_ID = os.environ.get('GOOGLE_SHEETS_ID')
-SHEETS_RANGE = 'Sheet1!A:F'  # Ajuste conforme sua aba
+SHEETS_RANGE = 'Sheet1!A:F'
 
 # Regex para extrair campos da mensagem
 FIELD_PATTERNS = {
@@ -28,8 +27,6 @@ FIELD_PATTERNS = {
 
 def get_google_services():
     """Inicializa serviços do Google (Drive e Sheets)"""
-    # Se estiver rodando no GCP, usa credenciais do ambiente
-    # Se local, usar service account JSON
     creds = None
     if os.path.exists('service_account.json'):
         creds = service_account.Credentials.from_service_account_file(
@@ -55,6 +52,69 @@ def extract_fields(text):
     return fields
 
 
+def parse_date_to_month_folder(data_str):
+    """
+    Converte a data para formato de pasta mensal (YYYY-MM)
+    Aceita formatos: DD/MM/YYYY, DD-MM-YYYY, YYYY-MM-DD
+    """
+    data_str = data_str.strip()
+
+    # Tenta diferentes formatos de data
+    formats = ['%d/%m/%Y', '%d-%m-%Y', '%Y-%m-%d', '%d/%m/%y', '%d-%m-%y']
+
+    for fmt in formats:
+        try:
+            parsed_date = datetime.strptime(data_str, fmt)
+            return parsed_date.strftime('%Y-%m')
+        except ValueError:
+            continue
+
+    # Se não conseguir parsear, usa o mês atual
+    return datetime.now().strftime('%Y-%m')
+
+
+def get_or_create_month_folder(drive_service, parent_folder_id, month_name):
+    """
+    Busca ou cria a pasta do mês dentro da pasta pai.
+    Retorna o ID da pasta do mês.
+    """
+    # Buscar pasta existente
+    query = f"name='{month_name}' and '{parent_folder_id}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false"
+    results = drive_service.files().list(
+        q=query,
+        spaces='drive',
+        fields='files(id, name)'
+    ).execute()
+
+    files = results.get('files', [])
+
+    if files:
+        return files[0]['id']
+
+    # Criar pasta se não existir
+    folder_metadata = {
+        'name': month_name,
+        'mimeType': 'application/vnd.google-apps.folder',
+        'parents': [parent_folder_id]
+    }
+
+    folder = drive_service.files().create(
+        body=folder_metadata,
+        fields='id'
+    ).execute()
+
+    return folder.get('id')
+
+
+def sanitize_filename(text):
+    """Remove caracteres inválidos para nome de arquivo"""
+    # Remove caracteres especiais que não são permitidos em nomes de arquivo
+    invalid_chars = ['/', '\\', ':', '*', '?', '"', '<', '>', '|']
+    for char in invalid_chars:
+        text = text.replace(char, '-')
+    return text.strip()
+
+
 def download_slack_file(file_info):
     """Baixa arquivo do Slack"""
     headers = {'Authorization': f'Bearer {SLACK_BOT_TOKEN}'}
@@ -65,11 +125,28 @@ def download_slack_file(file_info):
     return response.content, file_info['name'], file_info['mimetype']
 
 
-def upload_to_drive(drive_service, file_content, filename, mimetype):
-    """Faz upload do arquivo para o Google Drive"""
+def upload_to_drive(drive_service, file_content, original_filename, mimetype, fields):
+    """
+    Faz upload do arquivo para o Google Drive.
+    - Cria subpasta mensal baseada no campo DATA
+    - Renomeia arquivo para: DATA - VALOR - BANCO - EMPRESA - CL.extensão
+    """
+    # Extrair extensão do arquivo original
+    extension = ''
+    if '.' in original_filename:
+        extension = '.' + original_filename.rsplit('.', 1)[-1]
+
+    # Criar nome do arquivo: DATA - VALOR - BANCO - EMPRESA - CL
+    new_filename = f"{fields.get('DATA', '')} - {fields.get('VALOR', '')} - {fields.get('BANCO', '')} - {fields.get('EMPRESA', '')} - {fields.get('CL', '')}{extension}"
+    new_filename = sanitize_filename(new_filename)
+
+    # Determinar pasta do mês
+    month_folder_name = parse_date_to_month_folder(fields.get('DATA', ''))
+    month_folder_id = get_or_create_month_folder(drive_service, GOOGLE_DRIVE_FOLDER_ID, month_folder_name)
+
     file_metadata = {
-        'name': f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{filename}",
-        'parents': [GOOGLE_DRIVE_FOLDER_ID]
+        'name': new_filename,
+        'parents': [month_folder_id]
     }
 
     media = MediaIoBaseUpload(
@@ -150,8 +227,8 @@ def slack_webhook(request):
     link_comprovante = ''
     if files:
         file_info = files[0]  # Pega o primeiro arquivo
-        content, filename, mimetype = download_slack_file(file_info)
-        link_comprovante = upload_to_drive(drive_service, content, filename, mimetype)
+        content, original_filename, mimetype = download_slack_file(file_info)
+        link_comprovante = upload_to_drive(drive_service, content, original_filename, mimetype, fields)
 
     fields['LINK_COMPROVANTE'] = link_comprovante
 
