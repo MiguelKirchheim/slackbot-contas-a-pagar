@@ -208,8 +208,16 @@ def append_to_sheets(sheets_service, data):
 def slack_webhook(request):
     """Endpoint principal que recebe eventos do Slack"""
     try:
+        # Retornar mensagem simples para requisições GET (health check ou acesso direto)
+        if request.method == 'GET':
+            return {'status': 'ok', 'message': 'Slackbot Contas a Pagar está rodando'}
+
         # Verificação de URL (Slack envia isso na configuração inicial)
-        data = request.get_json()
+        data = request.get_json(force=True, silent=True)
+        if not data:
+            print("[WARN] Requisição sem JSON válido")
+            return {'ok': True}
+
         print(f"[DEBUG] Payload recebido: {json.dumps(data, indent=2, default=str)}")
 
         if data.get('type') == 'url_verification':
