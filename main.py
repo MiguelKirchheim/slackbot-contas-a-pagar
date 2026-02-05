@@ -192,6 +192,38 @@ def sanitize_folder_name(name: str) -> str:
     return re.sub(r'[\\/:*?"<>|]', "_", name).strip()
 
 
+def build_attachment_filename(fields: dict, original_name: str, index: int = 0) -> str:
+    """Gera nome do arquivo baseado em DATA e CL."""
+    # Extrai extensao do arquivo original
+    ext = ""
+    if "." in original_name:
+        ext = original_name.rsplit(".", 1)[-1]
+
+    # Data no formato DD-MM-YYYY
+    data_raw = fields.get("DATA", "")
+    try:
+        dt = datetime.strptime(data_raw.strip(), "%d/%m/%Y")
+        data_formatted = dt.strftime("%d-%m-%Y")
+    except ValueError:
+        data_formatted = data_raw.replace("/", "-")
+
+    # CL (ou "SEM-CL" se nao tiver)
+    cl = fields.get("CL", "").strip() or "SEM-CL"
+    cl = sanitize_folder_name(cl)  # Remove caracteres problematicos
+
+    # Monta o nome base
+    base_name = f"{data_formatted}_{cl}"
+
+    # Adiciona sufixo de duplicata se necessario
+    if index > 0:
+        base_name = f"{base_name}({index})"
+
+    # Adiciona extensao
+    if ext:
+        return f"{base_name}.{ext}"
+    return base_name
+
+
 def find_or_create_folder(drive, name: str, parent_id: str) -> str:
     """Busca pasta pelo nome dentro do parent. Cria se nao existir."""
     query = (
@@ -483,8 +515,10 @@ def slack_webhook(request):
         if files:
             logger.info(f"Baixando {len(files)} arquivo(s) do Slack...")
             downloaded = download_slack_files(files)
-            for f in downloaded:
-                upload_file_to_drive(drive, folder_id, f["content"], f["name"], f["mimetype"])
+            for i, f in enumerate(downloaded):
+                new_filename = build_attachment_filename(fields, f["name"], i)
+                upload_file_to_drive(drive, folder_id, f["content"], new_filename, f["mimetype"])
+                logger.info(f"Arquivo renomeado: {f['name']} -> {new_filename}")
             file_count = len(downloaded)
 
         # -- Registrar no Sheets --
