@@ -165,6 +165,142 @@ def send_slack_reply(channel, thread_ts, text):
         logger.warning(f"Falha ao enviar reply: {e}")
 
 
+def send_slack_message(channel, text, blocks=None):
+    """Envia mensagem para um canal."""
+    try:
+        payload = {"channel": channel, "text": text}
+        if blocks:
+            payload["blocks"] = blocks
+        response = requests.post(
+            "https://slack.com/api/chat.postMessage",
+            headers={"Authorization": f"Bearer {SLACK_BOT_TOKEN}"},
+            json=payload,
+        )
+        result = response.json()
+        if not result.get("ok"):
+            logger.warning(f"Erro ao enviar mensagem: {result.get('error')}")
+        return result
+    except Exception as e:
+        logger.warning(f"Falha ao enviar mensagem: {e}")
+        return None
+
+
+def open_slack_modal(trigger_id, view):
+    """Abre um modal no Slack."""
+    try:
+        response = requests.post(
+            "https://slack.com/api/views.open",
+            headers={"Authorization": f"Bearer {SLACK_BOT_TOKEN}"},
+            json={"trigger_id": trigger_id, "view": view},
+        )
+        result = response.json()
+        if not result.get("ok"):
+            logger.error(f"Erro ao abrir modal: {result.get('error')}")
+        return result
+    except Exception as e:
+        logger.error(f"Falha ao abrir modal: {e}")
+        return None
+
+
+def get_file_info(file_id):
+    """Obtem informacoes de um arquivo do Slack."""
+    try:
+        response = requests.get(
+            "https://slack.com/api/files.info",
+            headers={"Authorization": f"Bearer {SLACK_BOT_TOKEN}"},
+            params={"file": file_id},
+        )
+        result = response.json()
+        if result.get("ok"):
+            return result.get("file", {})
+        else:
+            logger.warning(f"Erro ao obter info do arquivo: {result.get('error')}")
+            return None
+    except Exception as e:
+        logger.warning(f"Falha ao obter info do arquivo: {e}")
+        return None
+
+
+# ============================================================
+# MODAL - DEFINICAO
+# ============================================================
+
+def get_payment_modal():
+    """Retorna a estrutura do modal de pagamento."""
+    return {
+        "type": "modal",
+        "callback_id": "pagamento_modal",
+        "title": {"type": "plain_text", "text": "Novo Pagamento"},
+        "submit": {"type": "plain_text", "text": "Registrar"},
+        "close": {"type": "plain_text", "text": "Cancelar"},
+        "blocks": [
+            {
+                "type": "input",
+                "block_id": "data_block",
+                "label": {"type": "plain_text", "text": "Data do Pagamento"},
+                "element": {
+                    "type": "datepicker",
+                    "action_id": "data_input",
+                    "placeholder": {"type": "plain_text", "text": "Selecione a data"},
+                },
+            },
+            {
+                "type": "input",
+                "block_id": "valor_block",
+                "label": {"type": "plain_text", "text": "Valor"},
+                "element": {
+                    "type": "plain_text_input",
+                    "action_id": "valor_input",
+                    "placeholder": {"type": "plain_text", "text": "Ex: R$ 1.500,00"},
+                },
+            },
+            {
+                "type": "input",
+                "block_id": "banco_block",
+                "label": {"type": "plain_text", "text": "Banco"},
+                "element": {
+                    "type": "plain_text_input",
+                    "action_id": "banco_input",
+                    "placeholder": {"type": "plain_text", "text": "Ex: Itau, Bradesco"},
+                },
+            },
+            {
+                "type": "input",
+                "block_id": "empresa_block",
+                "label": {"type": "plain_text", "text": "Empresa"},
+                "element": {
+                    "type": "plain_text_input",
+                    "action_id": "empresa_input",
+                    "placeholder": {"type": "plain_text", "text": "Nome da empresa"},
+                },
+            },
+            {
+                "type": "input",
+                "block_id": "cl_block",
+                "label": {"type": "plain_text", "text": "CL (Centro de Lucro)"},
+                "element": {
+                    "type": "plain_text_input",
+                    "action_id": "cl_input",
+                    "placeholder": {"type": "plain_text", "text": "Ex: CC001"},
+                },
+                "optional": True,
+            },
+            {
+                "type": "input",
+                "block_id": "files_block",
+                "label": {"type": "plain_text", "text": "Comprovantes"},
+                "element": {
+                    "type": "file_input",
+                    "action_id": "files_input",
+                    "filetypes": ["pdf", "jpg", "jpeg", "png"],
+                    "max_files": 10,
+                },
+                "optional": True,
+            },
+        ],
+    }
+
+
 # ============================================================
 # EXTRACAO DE CAMPOS
 # ============================================================
@@ -391,6 +527,224 @@ def ensure_headers(sheets):
 
 
 # ============================================================
+# HANDLERS - SLASH COMMANDS E INTERACTIONS
+# ============================================================
+
+def handle_slash_command(request):
+    """Handler para slash commands (ex: /pagamento)."""
+    # Slack envia como form-urlencoded
+    command = request.form.get("command", "")
+    trigger_id = request.form.get("trigger_id", "")
+    user_id = request.form.get("user_id", "")
+    channel_id = request.form.get("channel_id", "")
+
+    logger.info(f"Slash command recebido: {command} de {user_id} no canal {channel_id}")
+
+    if command == "/pagamento":
+        # Abre o modal de pagamento
+        modal = get_payment_modal()
+        # Armazena o channel_id no private_metadata para usar depois
+        modal["private_metadata"] = json.dumps({"channel_id": channel_id})
+        result = open_slack_modal(trigger_id, modal)
+
+        if result and result.get("ok"):
+            return ""  # Resposta vazia = sucesso (Slack espera 200 vazio)
+        else:
+            return "Erro ao abrir formulario. Tente novamente."
+
+    return ""
+
+
+def handle_interaction(request):
+    """Handler para interacoes (modal submissions, button clicks, etc)."""
+    # Slack envia como form-urlencoded com campo 'payload' contendo JSON
+    payload_str = request.form.get("payload", "{}")
+    payload = json.loads(payload_str)
+
+    interaction_type = payload.get("type", "")
+    logger.info(f"Interaction recebida: {interaction_type}")
+
+    if interaction_type == "view_submission":
+        return handle_modal_submission(payload)
+
+    return {"ok": True}
+
+
+def handle_modal_submission(payload):
+    """Processa a submissao do modal de pagamento."""
+    callback_id = payload.get("view", {}).get("callback_id", "")
+
+    if callback_id != "pagamento_modal":
+        return {"ok": True}
+
+    try:
+        view = payload.get("view", {})
+        user = payload.get("user", {})
+        user_id = user.get("id", "")
+        user_name = user.get("username", "")
+
+        # Extrai dados do modal
+        values = view.get("state", {}).get("values", {})
+
+        # Data (datepicker retorna YYYY-MM-DD)
+        data_iso = values.get("data_block", {}).get("data_input", {}).get("selected_date", "")
+        # Converte para DD/MM/YYYY
+        if data_iso:
+            try:
+                dt = datetime.strptime(data_iso, "%Y-%m-%d")
+                data_br = dt.strftime("%d/%m/%Y")
+            except ValueError:
+                data_br = data_iso
+        else:
+            data_br = ""
+
+        valor = values.get("valor_block", {}).get("valor_input", {}).get("value", "")
+        banco = values.get("banco_block", {}).get("banco_input", {}).get("value", "")
+        empresa = values.get("empresa_block", {}).get("empresa_input", {}).get("value", "")
+        cl = values.get("cl_block", {}).get("cl_input", {}).get("value", "")
+
+        # Arquivos (file_input)
+        files_data = values.get("files_block", {}).get("files_input", {}).get("files", [])
+
+        # Recupera o channel_id do private_metadata
+        private_metadata = view.get("private_metadata", "{}")
+        try:
+            metadata = json.loads(private_metadata)
+            channel_id = metadata.get("channel_id", "")
+        except json.JSONDecodeError:
+            channel_id = ""
+
+        fields = {
+            "DATA": data_br,
+            "VALOR": valor,
+            "BANCO": banco,
+            "EMPRESA": empresa,
+            "CL": cl,
+        }
+
+        logger.info(f"Modal submetido por {user_name}: {fields}")
+        logger.info(f"Arquivos: {len(files_data)}")
+
+        # Processa em background (responde rapidamente ao Slack)
+        # O Slack espera resposta em 3 segundos
+        process_modal_submission(fields, files_data, channel_id, user_id)
+
+        # Fecha o modal com mensagem de sucesso
+        return {
+            "response_action": "clear",
+        }
+
+    except Exception as e:
+        logger.error(f"Erro ao processar modal: {e}")
+        traceback.print_exc()
+        return {
+            "response_action": "errors",
+            "errors": {
+                "valor_block": f"Erro ao processar: {str(e)}"
+            }
+        }
+
+
+def process_modal_submission(fields, files_data, channel_id, user_id):
+    """Processa os dados do modal (Drive + Sheets + notificacao)."""
+    try:
+        # Valida campos obrigatorios
+        if not fields.get("DATA") or not fields.get("VALOR"):
+            if channel_id:
+                send_slack_message(channel_id, f"<@{user_id}> Erro: DATA e VALOR sao obrigatorios.")
+            return
+
+        # Inicializa servicos Google
+        logger.info("Inicializando servicos Google...")
+        drive, sheets = get_services()
+        ensure_headers(sheets)
+
+        # Cria pasta no Drive
+        logger.info("Criando pasta no Drive...")
+        folder_id, folder_link = create_lancamento_folder(drive, fields)
+        logger.info(f"Pasta criada: {folder_link}")
+
+        # Baixa e sobe arquivos
+        file_count = 0
+        if files_data:
+            logger.info(f"Processando {len(files_data)} arquivo(s)...")
+            for f in files_data:
+                file_id = f.get("id")
+                if not file_id:
+                    continue
+
+                # Obtem info do arquivo
+                file_info = get_file_info(file_id)
+                if not file_info:
+                    continue
+
+                # Baixa o arquivo
+                url = file_info.get("url_private_download") or file_info.get("url_private")
+                if not url:
+                    continue
+
+                headers = {"Authorization": f"Bearer {SLACK_BOT_TOKEN}"}
+                response = requests.get(url, headers=headers)
+
+                if response.status_code == 200:
+                    filename = file_info.get("name", f"arquivo_{file_id}")
+                    mimetype = file_info.get("mimetype", "application/octet-stream")
+                    upload_file_to_drive(drive, folder_id, response.content, filename, mimetype)
+                    file_count += 1
+                else:
+                    logger.warning(f"Erro ao baixar arquivo {file_id}: HTTP {response.status_code}")
+
+        # Registra no Sheets
+        logger.info("Salvando no Google Sheets...")
+        append_to_sheets(sheets, fields, folder_link)
+        logger.info("Registro salvo com sucesso!")
+
+        # Notifica no canal
+        if channel_id:
+            blocks = [
+                {
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": f"*Pagamento registrado por <@{user_id}>*"
+                    }
+                },
+                {
+                    "type": "section",
+                    "fields": [
+                        {"type": "mrkdwn", "text": f"*Data:* {fields.get('DATA', '-')}"},
+                        {"type": "mrkdwn", "text": f"*Valor:* {fields.get('VALOR', '-')}"},
+                        {"type": "mrkdwn", "text": f"*Banco:* {fields.get('BANCO', '-')}"},
+                        {"type": "mrkdwn", "text": f"*Empresa:* {fields.get('EMPRESA', '-')}"},
+                        {"type": "mrkdwn", "text": f"*CL:* {fields.get('CL', '-')}"},
+                        {"type": "mrkdwn", "text": f"*Arquivos:* {file_count}"},
+                    ]
+                },
+                {
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": f"<{folder_link}|Abrir pasta no Drive>"
+                    }
+                },
+            ]
+
+            send_slack_message(
+                channel_id,
+                f"Pagamento registrado por <@{user_id}>: {fields.get('EMPRESA', '')} - {fields.get('VALOR', '')}",
+                blocks=blocks
+            )
+
+        logger.info(f"Pagamento processado com sucesso via modal: {fields}")
+
+    except Exception as e:
+        logger.error(f"Erro ao processar pagamento do modal: {e}")
+        traceback.print_exc()
+        if channel_id:
+            send_slack_message(channel_id, f"<@{user_id}> Erro ao registrar pagamento: {str(e)}")
+
+
+# ============================================================
 # HANDLER PRINCIPAL
 # ============================================================
 
@@ -399,18 +753,31 @@ def slack_webhook(request):
     """
     Endpoint HTTP que recebe eventos do Slack.
 
-    Fluxo:
-    1. Verifica assinatura do Slack
-    2. Responde url_verification (setup)
-    3. Extrai campos da mensagem
-    4. Cria pasta no Drive e sobe anexos
-    5. Registra no Sheets
-    6. Reage na mensagem do Slack como confirmacao
+    Rotas:
+    - GET / : Health check
+    - POST /slack/commands : Slash commands
+    - POST /slack/interactions : Modal submissions e interacoes
+    - POST / ou /slack/events : Eventos (mensagens)
     """
 
     # -- Health check GET --
     if request.method == 'GET':
         return {'status': 'ok', 'message': 'Slackbot Contas a Pagar esta rodando'}
+
+    # -- Roteamento por path --
+    path = request.path
+
+    # Slash commands
+    if path == "/slack/commands":
+        if not verify_slack_signature(request):
+            return ("Unauthorized", 403)
+        return handle_slash_command(request)
+
+    # Interactions (modal submissions)
+    if path == "/slack/interactions":
+        if not verify_slack_signature(request):
+            return ("Unauthorized", 403)
+        return handle_interaction(request)
 
     # -- Verificacao de assinatura --
     if not verify_slack_signature(request):
