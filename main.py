@@ -423,7 +423,14 @@ def slack_webhook(request):
     # Processar apenas mensagens de usuarios
     if event.get("type") != "message":
         return {"ok": True}
-    if event.get("subtype") or event.get("bot_id"):
+
+    # Ignorar mensagens de bots
+    if event.get("bot_id"):
+        return {"ok": True}
+
+    # Ignorar subtypes que nao sao mensagens normais (exceto file_share que tem anexos)
+    subtype = event.get("subtype")
+    if subtype and subtype not in ["file_share"]:
         return {"ok": True}
 
     # Filtrar por canal especifico (se configurado)
