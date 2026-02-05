@@ -200,7 +200,13 @@ def find_or_create_folder(drive, name: str, parent_id: str) -> str:
         f"and mimeType = 'application/vnd.google-apps.folder' "
         f"and trashed = false"
     )
-    results = drive.files().list(q=query, fields="files(id)").execute()
+    # supportsAllDrives e includeItemsFromAllDrives para Shared Drives
+    results = drive.files().list(
+        q=query,
+        fields="files(id)",
+        supportsAllDrives=True,
+        includeItemsFromAllDrives=True
+    ).execute()
     files = results.get("files", [])
 
     if files:
@@ -211,7 +217,11 @@ def find_or_create_folder(drive, name: str, parent_id: str) -> str:
         "mimeType": "application/vnd.google-apps.folder",
         "parents": [parent_id],
     }
-    folder = drive.files().create(body=metadata, fields="id").execute()
+    folder = drive.files().create(
+        body=metadata,
+        fields="id",
+        supportsAllDrives=True
+    ).execute()
     logger.info(f"Pasta criada: {name} ({folder['id']})")
     return folder["id"]
 
@@ -268,10 +278,10 @@ def create_lancamento_folder(drive, fields: dict) -> tuple:
     lancamento_name = build_folder_name(fields)
     lancamento_folder_id = find_or_create_folder(drive, lancamento_name, month_folder_id)
 
-    # Pega o link da pasta
+    # Pega o link da pasta (supportsAllDrives para Shared Drives)
     folder_meta = (
         drive.files()
-        .get(fileId=lancamento_folder_id, fields="webViewLink")
+        .get(fileId=lancamento_folder_id, fields="webViewLink", supportsAllDrives=True)
         .execute()
     )
 
@@ -283,8 +293,12 @@ def upload_file_to_drive(drive, folder_id: str, content: bytes, filename: str, m
     metadata = {"name": filename, "parents": [folder_id]}
     media = MediaIoBaseUpload(io.BytesIO(content), mimetype=mimetype, resumable=True)
 
+    # supportsAllDrives para Shared Drives
     uploaded = drive.files().create(
-        body=metadata, media_body=media, fields="id, webViewLink"
+        body=metadata,
+        media_body=media,
+        fields="id, webViewLink",
+        supportsAllDrives=True
     ).execute()
 
     logger.info(f"Arquivo uploaded: {filename} ({uploaded['id']})")
