@@ -6,3 +6,5 @@ service_account.json
 .venv/
 .idea/
 .vscode/
+docs/
+.claude/

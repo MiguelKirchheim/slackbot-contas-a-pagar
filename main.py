@@ -1,290 +1,499 @@
+"""
+Slack Payment Bot - Cloud Function
+===================================
+Escuta mensagens no Slack, extrai campos de pagamento,
+cria pasta no Drive com os anexos e registra no Sheets.
+
+Formato esperado da mensagem:
+    DATA: 04/02/2025
+    VALOR: R$ 1.500,00
+    BANCO: Itau
+    EMPRESA: Empresa XYZ
+    CL: CC001
+    [arquivos anexados]
+
+Estrutura de pastas no Drive:
+    {PASTA_RAIZ}/
+      {YYYY-MM}/
+        {YYYY-MM-DD_VALOR_BANCO_EMPRESA_CL}/
+          comprovante.pdf
+          invoice.png
+"""
+
 import os
 import re
-import requests
 import json
+import hashlib
+import hmac
+import time
+import logging
 import traceback
+import requests
+import functions_framework
 from datetime import datetime
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload
 import io
-import functions_framework
-import google.auth
 
-# Configurações
-SLACK_BOT_TOKEN = os.environ.get('SLACK_BOT_TOKEN')
-SLACK_SIGNING_SECRET = os.environ.get('SLACK_SIGNING_SECRET')
-GOOGLE_DRIVE_FOLDER_ID = os.environ.get('GOOGLE_DRIVE_FOLDER_ID')
-GOOGLE_SHEETS_ID = os.environ.get('GOOGLE_SHEETS_ID')
-SHEETS_RANGE = 'Sheet1!A:F'
+# ============================================================
+# CONFIGURACAO
+# ============================================================
 
-# Regex para extrair campos da mensagem
+SLACK_BOT_TOKEN = os.environ.get("SLACK_BOT_TOKEN")
+SLACK_SIGNING_SECRET = os.environ.get("SLACK_SIGNING_SECRET")
+GOOGLE_DRIVE_FOLDER_ID = os.environ.get("GOOGLE_DRIVE_FOLDER_ID")
+GOOGLE_SHEETS_ID = os.environ.get("GOOGLE_SHEETS_ID")
+SHEETS_TAB_NAME = os.environ.get("SHEETS_TAB_NAME", "Lancamentos")
+SLACK_CHANNEL_ID = os.environ.get("SLACK_CHANNEL_ID", "")  # Opcional: filtrar canal
+
+# Service Account credentials (JSON string ou path)
+SA_CREDENTIALS_JSON = os.environ.get("SA_CREDENTIALS_JSON", "")
+SA_CREDENTIALS_PATH = os.environ.get("SA_CREDENTIALS_PATH", "service_account.json")
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# ============================================================
+# REGEX PARA EXTRACAO DOS CAMPOS
+# ============================================================
+
 FIELD_PATTERNS = {
-    'DATA': r'DATA[:\s]+([^\n]+)',
-    'VALOR': r'VALOR[:\s]+([^\n]+)',
-    'BANCO': r'BANCO[:\s]+([^\n]+)',
-    'EMPRESA': r'EMPRESA[:\s]+([^\n]+)',
-    'CL': r'CL[:\s]+([^\n]+)',
+    "DATA":    r"DATA\s*[:\-]\s*(.+?)(?:\n|$)",
+    "VALOR":   r"VALOR\s*[:\-]\s*(.+?)(?:\n|$)",
+    "BANCO":   r"BANCO\s*[:\-]\s*(.+?)(?:\n|$)",
+    "EMPRESA": r"EMPRESA\s*[:\-]\s*(.+?)(?:\n|$)",
+    "CL":      r"CL\s*[:\-]\s*(.+?)(?:\n|$)",
 }
 
+REQUIRED_FIELDS = ["DATA", "VALOR"]
 
-def get_google_services():
-    """Inicializa serviços do Google (Drive e Sheets)"""
+
+# ============================================================
+# GOOGLE SERVICES
+# ============================================================
+
+def get_google_credentials():
+    """Obtem credenciais do Google a partir de variavel de ambiente ou arquivo."""
+    scopes = [
+        "https://www.googleapis.com/auth/drive",
+        "https://www.googleapis.com/auth/spreadsheets",
+    ]
+
+    if SA_CREDENTIALS_JSON:
+        info = json.loads(SA_CREDENTIALS_JSON)
+        return service_account.Credentials.from_service_account_info(info, scopes=scopes)
+
+    if os.path.exists(SA_CREDENTIALS_PATH):
+        return service_account.Credentials.from_service_account_file(
+            SA_CREDENTIALS_PATH, scopes=scopes
+        )
+
+    # No GCP, usa Application Default Credentials
+    from google.auth import default
+    creds, _ = default(scopes=scopes)
+    return creds
+
+
+def get_services():
+    """Inicializa Drive e Sheets services."""
+    creds = get_google_credentials()
+    drive = build("drive", "v3", credentials=creds, cache_discovery=False)
+    sheets = build("sheets", "v4", credentials=creds, cache_discovery=False)
+    return drive, sheets
+
+
+# ============================================================
+# SLACK - VERIFICACAO E HELPERS
+# ============================================================
+
+def verify_slack_signature(request):
+    """Verifica que a request realmente veio do Slack."""
+    if not SLACK_SIGNING_SECRET:
+        logger.warning("SLACK_SIGNING_SECRET nao configurado, pulando verificacao.")
+        return True
+
+    timestamp = request.headers.get("X-Slack-Request-Timestamp", "")
+    signature = request.headers.get("X-Slack-Signature", "")
+
+    if not timestamp or not signature:
+        return True  # Headers nao presentes, permite (pode ser health check)
+
     try:
-        if os.path.exists('service_account.json'):
-            creds = service_account.Credentials.from_service_account_file(
-                'service_account.json',
-                scopes=[
-                    'https://www.googleapis.com/auth/drive',
-                    'https://www.googleapis.com/auth/spreadsheets'
-                ]
-            )
-        else:
-            # No GCP, usa credenciais padrão do ambiente
-            creds, project = google.auth.default(scopes=[
-                'https://www.googleapis.com/auth/drive',
-                'https://www.googleapis.com/auth/spreadsheets'
-            ])
-            print(f"[INFO] Usando credenciais padrão do projeto: {project}")
+        if abs(time.time() - int(timestamp)) > 60 * 5:
+            return False
+    except ValueError:
+        return False
 
-        drive_service = build('drive', 'v3', credentials=creds)
-        sheets_service = build('sheets', 'v4', credentials=creds)
+    sig_basestring = f"v0:{timestamp}:{request.get_data(as_text=True)}"
+    my_signature = "v0=" + hmac.new(
+        SLACK_SIGNING_SECRET.encode(),
+        sig_basestring.encode(),
+        hashlib.sha256,
+    ).hexdigest()
 
-        return drive_service, sheets_service
+    return hmac.compare_digest(my_signature, signature)
+
+
+def send_slack_reaction(channel, timestamp, emoji="white_check_mark"):
+    """Adiciona uma reacao na mensagem do Slack como feedback."""
+    try:
+        response = requests.post(
+            "https://slack.com/api/reactions.add",
+            headers={"Authorization": f"Bearer {SLACK_BOT_TOKEN}"},
+            json={"channel": channel, "timestamp": timestamp, "name": emoji},
+        )
+        result = response.json()
+        if not result.get("ok"):
+            logger.warning(f"Erro ao adicionar reacao: {result.get('error')}")
     except Exception as e:
-        print(f"[ERROR] Falha ao inicializar serviços Google: {e}")
-        traceback.print_exc()
-        raise
+        logger.warning(f"Falha ao enviar reacao: {e}")
 
 
-def extract_fields(text):
-    """Extrai os campos da mensagem usando regex"""
+def send_slack_reply(channel, thread_ts, text):
+    """Responde na thread da mensagem."""
+    try:
+        response = requests.post(
+            "https://slack.com/api/chat.postMessage",
+            headers={"Authorization": f"Bearer {SLACK_BOT_TOKEN}"},
+            json={"channel": channel, "thread_ts": thread_ts, "text": text},
+        )
+        result = response.json()
+        if not result.get("ok"):
+            logger.warning(f"Erro ao enviar reply: {result.get('error')}")
+    except Exception as e:
+        logger.warning(f"Falha ao enviar reply: {e}")
+
+
+# ============================================================
+# EXTRACAO DE CAMPOS
+# ============================================================
+
+def extract_fields(text: str) -> dict:
+    """Extrai os campos da mensagem usando regex."""
     fields = {}
-    for field_name, pattern in FIELD_PATTERNS.items():
+    for name, pattern in FIELD_PATTERNS.items():
         match = re.search(pattern, text, re.IGNORECASE)
-        fields[field_name] = match.group(1).strip() if match else ''
+        fields[name] = match.group(1).strip() if match else ""
     return fields
 
 
-def parse_date_to_month_folder(data_str):
-    """
-    Converte a data para formato de pasta mensal (YYYY-MM)
-    Aceita formatos: DD/MM/YYYY, DD-MM-YYYY, YYYY-MM-DD
-    """
-    data_str = data_str.strip()
-
-    # Tenta diferentes formatos de data
-    formats = ['%d/%m/%Y', '%d-%m-%Y', '%Y-%m-%d', '%d/%m/%y', '%d-%m-%y']
-
-    for fmt in formats:
-        try:
-            parsed_date = datetime.strptime(data_str, fmt)
-            return parsed_date.strftime('%Y-%m')
-        except ValueError:
-            continue
-
-    # Se não conseguir parsear, usa o mês atual
-    return datetime.now().strftime('%Y-%m')
+def has_required_fields(fields: dict) -> bool:
+    """Verifica se os campos obrigatorios foram encontrados."""
+    return all(fields.get(f) for f in REQUIRED_FIELDS)
 
 
-def get_or_create_month_folder(drive_service, parent_folder_id, month_name):
-    """
-    Busca ou cria a pasta do mês dentro da pasta pai.
-    Retorna o ID da pasta do mês.
-    """
-    # Buscar pasta existente
-    query = f"name='{month_name}' and '{parent_folder_id}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false"
-    results = drive_service.files().list(
-        q=query,
-        spaces='drive',
-        fields='files(id, name)'
-    ).execute()
+# ============================================================
+# GOOGLE DRIVE - PASTAS E UPLOAD
+# ============================================================
 
-    files = results.get('files', [])
+def sanitize_folder_name(name: str) -> str:
+    """Remove caracteres problematicos para nome de pasta."""
+    return re.sub(r'[\\/:*?"<>|]', "_", name).strip()
+
+
+def find_or_create_folder(drive, name: str, parent_id: str) -> str:
+    """Busca pasta pelo nome dentro do parent. Cria se nao existir."""
+    query = (
+        f"name = '{name}' "
+        f"and '{parent_id}' in parents "
+        f"and mimeType = 'application/vnd.google-apps.folder' "
+        f"and trashed = false"
+    )
+    results = drive.files().list(q=query, fields="files(id)").execute()
+    files = results.get("files", [])
 
     if files:
-        return files[0]['id']
+        return files[0]["id"]
 
-    # Criar pasta se não existir
-    folder_metadata = {
-        'name': month_name,
-        'mimeType': 'application/vnd.google-apps.folder',
-        'parents': [parent_folder_id]
+    metadata = {
+        "name": name,
+        "mimeType": "application/vnd.google-apps.folder",
+        "parents": [parent_id],
     }
-
-    folder = drive_service.files().create(
-        body=folder_metadata,
-        fields='id'
-    ).execute()
-
-    return folder.get('id')
+    folder = drive.files().create(body=metadata, fields="id").execute()
+    logger.info(f"Pasta criada: {name} ({folder['id']})")
+    return folder["id"]
 
 
-def sanitize_filename(text):
-    """Remove caracteres inválidos para nome de arquivo"""
-    # Remove caracteres especiais que não são permitidos em nomes de arquivo
-    invalid_chars = ['/', '\\', ':', '*', '?', '"', '<', '>', '|']
-    for char in invalid_chars:
-        text = text.replace(char, '-')
-    return text.strip()
+def build_folder_name(fields: dict) -> str:
+    """Monta o nome da pasta do lancamento a partir dos campos."""
+    parts = []
+
+    # Data no formato ISO para ordenacao
+    data_raw = fields.get("DATA", "")
+    try:
+        dt = datetime.strptime(data_raw.strip(), "%d/%m/%Y")
+        parts.append(dt.strftime("%Y-%m-%d"))
+    except ValueError:
+        parts.append(data_raw.replace("/", "-"))
+
+    # Valor simplificado
+    valor = fields.get("VALOR", "").replace(" ", "")
+    parts.append(valor)
+
+    # Banco e Empresa
+    for field in ["BANCO", "EMPRESA", "CL"]:
+        val = fields.get(field, "").strip()
+        if val:
+            parts.append(val)
+
+    folder_name = "_".join(parts)
+    return sanitize_folder_name(folder_name)
 
 
-def download_slack_file(file_info):
-    """Baixa arquivo do Slack"""
-    headers = {'Authorization': f'Bearer {SLACK_BOT_TOKEN}'}
-    response = requests.get(
-        file_info['url_private_download'],
-        headers=headers
-    )
-    return response.content, file_info['name'], file_info['mimetype']
+def get_month_folder_name(fields: dict) -> str:
+    """Retorna o nome da pasta do mes (ex: 2025-02)."""
+    data_raw = fields.get("DATA", "")
+    try:
+        dt = datetime.strptime(data_raw.strip(), "%d/%m/%Y")
+        return dt.strftime("%Y-%m")
+    except ValueError:
+        # Fallback: mes atual
+        return datetime.now().strftime("%Y-%m")
 
 
-def upload_to_drive(drive_service, file_content, original_filename, mimetype, fields):
+def create_lancamento_folder(drive, fields: dict) -> tuple:
     """
-    Faz upload do arquivo para o Google Drive.
-    - Cria subpasta mensal baseada no campo DATA
-    - Renomeia arquivo para: DATA - VALOR - BANCO - EMPRESA - CL.extensão
+    Cria a estrutura de pastas:
+        {ROOT}/{YYYY-MM}/{nome_lancamento}/
+
+    Retorna (folder_id, web_view_link).
     """
-    # Extrair extensão do arquivo original
-    extension = ''
-    if '.' in original_filename:
-        extension = '.' + original_filename.rsplit('.', 1)[-1]
+    # 1. Pasta do mes
+    month_name = get_month_folder_name(fields)
+    month_folder_id = find_or_create_folder(drive, month_name, GOOGLE_DRIVE_FOLDER_ID)
 
-    # Criar nome do arquivo: DATA - VALOR - BANCO - EMPRESA - CL
-    new_filename = f"{fields.get('DATA', '')} - {fields.get('VALOR', '')} - {fields.get('BANCO', '')} - {fields.get('EMPRESA', '')} - {fields.get('CL', '')}{extension}"
-    new_filename = sanitize_filename(new_filename)
+    # 2. Pasta do lancamento
+    lancamento_name = build_folder_name(fields)
+    lancamento_folder_id = find_or_create_folder(drive, lancamento_name, month_folder_id)
 
-    # Determinar pasta do mês
-    month_folder_name = parse_date_to_month_folder(fields.get('DATA', ''))
-    month_folder_id = get_or_create_month_folder(drive_service, GOOGLE_DRIVE_FOLDER_ID, month_folder_name)
-
-    file_metadata = {
-        'name': new_filename,
-        'parents': [month_folder_id]
-    }
-
-    media = MediaIoBaseUpload(
-        io.BytesIO(file_content),
-        mimetype=mimetype,
-        resumable=True
+    # Pega o link da pasta
+    folder_meta = (
+        drive.files()
+        .get(fileId=lancamento_folder_id, fields="webViewLink")
+        .execute()
     )
 
-    file = drive_service.files().create(
-        body=file_metadata,
-        media_body=media,
-        fields='id, webViewLink'
+    return lancamento_folder_id, folder_meta.get("webViewLink", "")
+
+
+def upload_file_to_drive(drive, folder_id: str, content: bytes, filename: str, mimetype: str):
+    """Faz upload de um arquivo para a pasta no Drive."""
+    metadata = {"name": filename, "parents": [folder_id]}
+    media = MediaIoBaseUpload(io.BytesIO(content), mimetype=mimetype, resumable=True)
+
+    uploaded = drive.files().create(
+        body=metadata, media_body=media, fields="id, webViewLink"
     ).execute()
 
-    # Tornar o arquivo acessível via link
-    drive_service.permissions().create(
-        fileId=file['id'],
-        body={'type': 'anyone', 'role': 'reader'}
-    ).execute()
-
-    return file.get('webViewLink')
+    logger.info(f"Arquivo uploaded: {filename} ({uploaded['id']})")
+    return uploaded
 
 
-def append_to_sheets(sheets_service, data):
-    """Adiciona linha no Google Sheets"""
+# ============================================================
+# SLACK - DOWNLOAD DE ARQUIVOS
+# ============================================================
+
+def download_slack_files(files: list) -> list:
+    """Baixa todos os arquivos anexados na mensagem do Slack."""
+    downloaded = []
+    headers = {"Authorization": f"Bearer {SLACK_BOT_TOKEN}"}
+
+    for f in files:
+        url = f.get("url_private_download") or f.get("url_private")
+        if not url:
+            logger.warning(f"Arquivo sem URL de download: {f.get('name')}")
+            continue
+
+        response = requests.get(url, headers=headers)
+        if response.status_code == 200:
+            downloaded.append({
+                "content": response.content,
+                "name": f.get("name", "arquivo"),
+                "mimetype": f.get("mimetype", "application/octet-stream"),
+            })
+        else:
+            logger.error(f"Erro ao baixar {f.get('name')}: HTTP {response.status_code}")
+
+    return downloaded
+
+
+# ============================================================
+# GOOGLE SHEETS - REGISTRO
+# ============================================================
+
+def append_to_sheets(sheets, fields: dict, folder_link: str):
+    """Adiciona uma linha no Google Sheets com os dados do lancamento."""
+    now = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
+
     values = [[
-        data.get('DATA', ''),
-        data.get('VALOR', ''),
-        data.get('BANCO', ''),
-        data.get('EMPRESA', ''),
-        data.get('CL', ''),
-        data.get('LINK_COMPROVANTE', '')
+        fields.get("DATA", ""),
+        fields.get("VALOR", ""),
+        fields.get("BANCO", ""),
+        fields.get("EMPRESA", ""),
+        fields.get("CL", ""),
+        folder_link,
+        now,  # Timestamp do registro
     ]]
 
-    sheets_service.spreadsheets().values().append(
+    sheets.spreadsheets().values().append(
         spreadsheetId=GOOGLE_SHEETS_ID,
-        range=SHEETS_RANGE,
-        valueInputOption='USER_ENTERED',
-        insertDataOption='INSERT_ROWS',
-        body={'values': values}
+        range=f"{SHEETS_TAB_NAME}!A:G",
+        valueInputOption="USER_ENTERED",
+        insertDataOption="INSERT_ROWS",
+        body={"values": values},
     ).execute()
 
+    logger.info(f"Linha adicionada no Sheets: {fields.get('DATA')} - {fields.get('EMPRESA')}")
+
+
+# ============================================================
+# SETUP INICIAL DO SHEETS (headers)
+# ============================================================
+
+def ensure_headers(sheets):
+    """Garante que a primeira linha tenha os cabecalhos."""
+    try:
+        result = (
+            sheets.spreadsheets()
+            .values()
+            .get(spreadsheetId=GOOGLE_SHEETS_ID, range=f"{SHEETS_TAB_NAME}!A1:G1")
+            .execute()
+        )
+        values = result.get("values", [])
+
+        if not values:
+            headers = [["DATA", "VALOR", "BANCO", "EMPRESA", "CL", "LINK PASTA", "REGISTRADO EM"]]
+            sheets.spreadsheets().values().update(
+                spreadsheetId=GOOGLE_SHEETS_ID,
+                range=f"{SHEETS_TAB_NAME}!A1:G1",
+                valueInputOption="RAW",
+                body={"values": headers},
+            ).execute()
+            logger.info("Headers criados no Sheets.")
+    except Exception as e:
+        logger.warning(f"Erro ao verificar headers: {e}")
+
+
+# ============================================================
+# HANDLER PRINCIPAL
+# ============================================================
 
 @functions_framework.http
 def slack_webhook(request):
-    """Endpoint principal que recebe eventos do Slack"""
+    """
+    Endpoint HTTP que recebe eventos do Slack.
+
+    Fluxo:
+    1. Verifica assinatura do Slack
+    2. Responde url_verification (setup)
+    3. Extrai campos da mensagem
+    4. Cria pasta no Drive e sobe anexos
+    5. Registra no Sheets
+    6. Reage na mensagem do Slack como confirmacao
+    """
+
+    # -- Health check GET --
+    if request.method == 'GET':
+        return {'status': 'ok', 'message': 'Slackbot Contas a Pagar esta rodando'}
+
+    # -- Verificacao de assinatura --
+    if not verify_slack_signature(request):
+        logger.warning("Assinatura invalida do Slack.")
+        return ("Unauthorized", 403)
+
+    data = request.get_json(force=True, silent=True)
+    if not data:
+        logger.warning("Requisicao sem JSON valido")
+        return {"ok": True}
+
+    logger.info(f"Payload recebido: {json.dumps(data, indent=2, default=str)}")
+
+    # -- URL Verification (setup inicial do Slack) --
+    if data.get("type") == "url_verification":
+        return {"challenge": data["challenge"]}
+
+    # -- Ignorar retries do Slack --
+    if request.headers.get("X-Slack-Retry-Num"):
+        return {"ok": True}
+
+    event = data.get("event", {})
+
+    # Processar apenas mensagens de usuarios
+    if event.get("type") != "message":
+        return {"ok": True}
+    if event.get("subtype") or event.get("bot_id"):
+        return {"ok": True}
+
+    # Filtrar por canal especifico (se configurado)
+    channel = event.get("channel", "")
+    if SLACK_CHANNEL_ID and channel != SLACK_CHANNEL_ID:
+        return {"ok": True}
+
+    text = event.get("text", "")
+    files = event.get("files", [])
+    message_ts = event.get("ts", "")
+
+    # -- Extrair campos --
+    fields = extract_fields(text)
+    logger.info(f"Campos extraidos: {fields}")
+
+    if not has_required_fields(fields):
+        return {"ok": True}  # Mensagem nao e um lancamento, ignora silenciosamente
+
     try:
-        # Retornar mensagem simples para requisições GET (health check ou acesso direto)
-        if request.method == 'GET':
-            return {'status': 'ok', 'message': 'Slackbot Contas a Pagar está rodando'}
+        # -- Inicializar servicos Google --
+        logger.info("Inicializando servicos Google...")
+        logger.info(f"DRIVE_FOLDER_ID: {GOOGLE_DRIVE_FOLDER_ID}")
+        logger.info(f"SHEETS_ID: {GOOGLE_SHEETS_ID}")
+        logger.info(f"SHEETS_TAB_NAME: {SHEETS_TAB_NAME}")
 
-        # Verificação de URL (Slack envia isso na configuração inicial)
-        data = request.get_json(force=True, silent=True)
-        if not data:
-            print("[WARN] Requisição sem JSON válido")
-            return {'ok': True}
+        drive, sheets = get_services()
+        ensure_headers(sheets)
 
-        print(f"[DEBUG] Payload recebido: {json.dumps(data, indent=2, default=str)}")
+        # -- Criar pasta no Drive --
+        logger.info("Criando pasta no Drive...")
+        folder_id, folder_link = create_lancamento_folder(drive, fields)
+        logger.info(f"Pasta criada: {folder_link}")
 
-        if data.get('type') == 'url_verification':
-            print("[INFO] Verificação de URL do Slack")
-            return {'challenge': data['challenge']}
-
-        # Ignorar eventos de retry ou do próprio bot
-        if request.headers.get('X-Slack-Retry-Num'):
-            print("[INFO] Ignorando retry do Slack")
-            return {'ok': True}
-
-        event = data.get('event', {})
-        print(f"[DEBUG] Tipo de evento: {event.get('type')}")
-        print(f"[DEBUG] Bot ID: {event.get('bot_id')}")
-        print(f"[DEBUG] Subtype: {event.get('subtype')}")
-
-        # Processar apenas mensagens de usuários (não bots)
-        if event.get('type') != 'message' or event.get('bot_id'):
-            print(f"[INFO] Ignorando: tipo={event.get('type')}, bot_id={event.get('bot_id')}")
-            return {'ok': True}
-
-        # Ignorar subtipos de mensagem (edições, etc)
-        if event.get('subtype'):
-            print(f"[INFO] Ignorando subtype: {event.get('subtype')}")
-            return {'ok': True}
-
-        text = event.get('text', '')
-        files = event.get('files', [])
-        print(f"[DEBUG] Texto da mensagem: {text}")
-        print(f"[DEBUG] Arquivos anexados: {len(files)}")
-
-        # Verificar se a mensagem tem os campos esperados
-        fields = extract_fields(text)
-        print(f"[DEBUG] Campos extraídos: {fields}")
-
-        # Se não encontrou pelo menos DATA e VALOR, ignora
-        if not fields.get('DATA') or not fields.get('VALOR'):
-            print(f"[INFO] Campos obrigatórios não encontrados. DATA={fields.get('DATA')}, VALOR={fields.get('VALOR')}")
-            return {'ok': True}
-
-        print("[INFO] Processando mensagem válida...")
-        print(f"[DEBUG] DRIVE_FOLDER_ID: {GOOGLE_DRIVE_FOLDER_ID}")
-        print(f"[DEBUG] SHEETS_ID: {GOOGLE_SHEETS_ID}")
-
-        # Inicializar serviços Google
-        drive_service, sheets_service = get_google_services()
-
-        # Se tiver arquivo, faz upload para o Drive
-        link_comprovante = ''
+        # -- Baixar e subir arquivos --
+        file_count = 0
         if files:
-            file_info = files[0]  # Pega o primeiro arquivo
-            print(f"[INFO] Baixando arquivo: {file_info.get('name')}")
-            content, original_filename, mimetype = download_slack_file(file_info)
-            print(f"[INFO] Fazendo upload para o Drive...")
-            link_comprovante = upload_to_drive(drive_service, content, original_filename, mimetype, fields)
-            print(f"[INFO] Arquivo salvo: {link_comprovante}")
+            logger.info(f"Baixando {len(files)} arquivo(s) do Slack...")
+            downloaded = download_slack_files(files)
+            for f in downloaded:
+                upload_file_to_drive(drive, folder_id, f["content"], f["name"], f["mimetype"])
+            file_count = len(downloaded)
 
-        fields['LINK_COMPROVANTE'] = link_comprovante
+        # -- Registrar no Sheets --
+        logger.info("Salvando no Google Sheets...")
+        append_to_sheets(sheets, fields, folder_link)
+        logger.info("Registro salvo com sucesso!")
 
-        # Registrar no Sheets
-        print("[INFO] Salvando no Google Sheets...")
-        append_to_sheets(sheets_service, fields)
-        print("[INFO] Registro salvo com sucesso!")
+        # -- Feedback no Slack --
+        send_slack_reaction(channel, message_ts, "white_check_mark")
 
-        return {'ok': True}
+        if file_count > 0:
+            reply = (
+                f"*Lancamento registrado!*\n"
+                f"Pasta: {folder_link}\n"
+                f"{file_count} arquivo(s) salvos"
+            )
+        else:
+            reply = (
+                f"*Lancamento registrado!*\n"
+                f"Pasta: {folder_link}\n"
+                f"Nenhum comprovante anexado"
+            )
+        send_slack_reply(channel, message_ts, reply)
+
+        logger.info(f"Lancamento processado com sucesso: {fields}")
 
     except Exception as e:
-        print(f"[ERROR] Erro ao processar webhook: {e}")
+        logger.error(f"Erro ao processar lancamento: {e}")
         traceback.print_exc()
-        return {'ok': False, 'error': str(e)}, 500
+        send_slack_reaction(channel, message_ts, "x")
+        send_slack_reply(channel, message_ts, f"Erro ao processar lancamento: {str(e)}")
+
+    return {"ok": True}

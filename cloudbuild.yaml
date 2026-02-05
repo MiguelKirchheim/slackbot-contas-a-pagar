@@ -39,12 +39,13 @@ steps:
       - '--timeout=60s'
       - '--max-instances=3'
       - '--allow-unauthenticated'
-      - '--set-env-vars=GOOGLE_DRIVE_FOLDER_ID=${_DRIVE_FOLDER_ID},GOOGLE_SHEETS_ID=${_SHEETS_ID}'
+      - '--set-env-vars=GOOGLE_DRIVE_FOLDER_ID=${_DRIVE_FOLDER_ID},GOOGLE_SHEETS_ID=${_SHEETS_ID},SHEETS_TAB_NAME=${_SHEETS_TAB_NAME}'
       - '--set-secrets=SLACK_BOT_TOKEN=SLACK_BOT_TOKEN:latest,SLACK_SIGNING_SECRET=SLACK_SIGNING_SECRET:latest'
 
 substitutions:
   _DRIVE_FOLDER_ID: 'SEU_FOLDER_ID'
   _SHEETS_ID: 'SEU_SHEETS_ID'
+  _SHEETS_TAB_NAME: 'Lancamentos'
 
 options:
   logging: CLOUD_LOGGING_ONLY
